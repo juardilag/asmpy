@@ -183,4 +183,4 @@ def propagate_asm_spatiotemporal(E_in_txy, z, L, T, wavelength_0, n_func=None):
     E_out_t_shifted = jfft.ifft(E_tilde_out_delta_omega_xy, axis=0)
     E_out_txy = jfft.fftshift(E_out_t_shifted, axes=0)
     
-    return E_out_txy, t
+    return E_out_txy
