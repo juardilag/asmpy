@@ -299,33 +299,30 @@ def get_asm_phase_masks(N_t, N_x, L, T, wavelength, n_func, dz):
 def apply_linear_step(E_txy, H_cube):
     """
     Applies the pre-calculated ASM phase mask.
-    E_txy: (N_t, N_x, N_y)
-    H_cube: (N_t, N_x, N_y) Pre-computed exp(i*kz*dz)
+    Correctly handles centering in both Time and Space.
     """
-    # FFT Time -> Freq
-    E_w = jfft.fft(E_txy, axis=0)
+    # 1. Shift Time Center (t=0) to array index 0
+    # This removes the linear phase ramp so the spectrum is centered
+    E_t_centered = jfft.ifftshift(E_txy, axes=0)
     
-    # Shift Spatial -> k-space (using fft2)
-    # Note: We need ifftshift on input for standard FFT center handling
-    # but since we act on the whole cube, we can be careful.
-    # Let's stick to the robust shift-fft-shift method from your code.
+    # 2. FFT Time -> Freq (Standard Order)
+    E_w = jfft.fft(E_t_centered, axis=0)
     
-    # 1. Shift time center to origin
-    E_w_shifted = jfft.ifftshift(E_w, axes=0) 
+    # 3. Shift Space Center ((0,0) coordinate) to array indices (0,0)
+    E_w_space_centered = jfft.ifftshift(E_w, axes=(1,2))
     
-    # 2. Shift space center to origin
-    E_w_space_shifted = jfft.ifftshift(E_w_shifted, axes=(1,2))
+    # 4. FFT Space -> k-space
+    A_in = jfft.fft2(E_w_space_centered, axes=(1,2))
     
-    # 3. Spatial FFT
-    A_in = jfft.fft2(E_w_space_shifted, axes=(1,2))
-    
-    # 4. Apply Mask
+    # 5. Apply Mask (H_cube is already in standard FFT order)
     A_out = A_in * H_cube
     
-    # 5. Inverse Transforms
-    E_out_space_shifted = jfft.ifft2(A_out, axes=(1,2))
-    E_out_shifted = jfft.fftshift(E_out_space_shifted, axes=(1,2))
-    E_txy_out = jfft.ifft(jfft.fftshift(E_out_shifted, axes=0), axis=0)
+    # 6. Inverse Transforms (Reverse the steps)
+    E_out_space_centered = jfft.ifft2(A_out, axes=(1,2))
+    E_out_w = jfft.fftshift(E_out_space_centered, axes=(1,2))
+    
+    E_out_t_centered = jfft.ifft(E_out_w, axis=0)
+    E_txy_out = jfft.fftshift(E_out_t_centered, axes=0)
     
     return E_txy_out
 
