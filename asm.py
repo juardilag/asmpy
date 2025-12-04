@@ -38,6 +38,38 @@ def initialize_gaussian_pulse_3d(N_t, N_x, L, T, w0, tau, chirp=0.0):
 
     return temporal_profile * spatial_profile
 
+def normalize_field_to_energy(E_txy, energy_joules, dx, dt, n=1.0):
+    """
+    Rescales a field array E_txy so that its total energy equals 'energy_joules'.
+    
+    Args:
+        E_txy: The input complex field (arbitrary amplitude).
+        energy_joules: Desired pulse energy (e.g., 1e-9 for 1 nJ).
+        dx: Spatial grid step (meters).
+        dt: Time grid step (seconds).
+        n: Refractive index.
+        
+    Returns:
+        jax.Array: The rescaled field in units of [V/m].
+    """
+    c = 299792458.0
+    epsilon0 = 8.8541878128e-12
+    
+    # 1. Calculate current "unscaled" energy in the grid
+    # Energy = Sum( Intensity * dA * dt )
+    # Intensity = 0.5 * c * n * eps0 * |E|^2
+    
+    intensity_unscaled = 0.5 * c * n * epsilon0 * jnp.abs(E_txy)**2
+    total_energy_current = jnp.sum(intensity_unscaled) * (dx**2) * dt
+    
+    # 2. Calculate Scaling Factor
+    # We need: total_energy_current * scale^2 = energy_joules
+    scale_factor = jnp.sqrt(energy_joules / total_energy_current)
+    
+    print(f"Rescaling input field by factor: {scale_factor:.2e}")
+    return E_txy * scale_factor
+
+# ASM implementation
 
 @jax.jit
 def propagate_spatial_asm(E_in, z, L, wavelength, n=1.0):
