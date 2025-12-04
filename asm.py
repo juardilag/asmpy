@@ -4,6 +4,41 @@ import numpy as np
 import jax.numpy.fft as jfft
 from functools import partial
 
+# Pulse Initialation
+
+def initialize_gaussian_pulse_3d(N_t, N_x, L, T, w0, tau, chirp=0.0):
+    """
+    Initializes a 3D spatiotemporal Gaussian pulse.
+
+    Args:
+        N_t, N_x: Grid points in time and space (N_y assumed equal to N_x).
+        L: Spatial box size.
+        T: Temporal window size.
+        w0: Beam waist radius (spatial width).
+        tau: Pulse duration (temporal width).
+        chirp: Linear chirp parameter (C).
+
+    Returns:
+        jnp.ndarray: The 3D complex field envelope E(t, x, y).
+    """
+    # Grid setup
+    t = jnp.linspace(-T/2, T/2, N_t)
+    x = jnp.linspace(-L/2, L/2, N_x)
+    X, Y = jnp.meshgrid(x, x, indexing='ij')
+
+    # Temporal Gaussian with Chirp: exp(-(1+iC) * t^2 / (2*tau^2))
+    # We use broadcasting: t shape (N_t, 1, 1)
+    temporal_profile = jnp.exp(-(1 + 1j * chirp) * (t[:, None, None]**2) / (2 * tau**2))
+
+    # Spatial Gaussian: exp(-(x^2 + y^2) / w0^2)
+    # Shape (1, N_x, N_x)
+    r_squared = X**2 + Y**2
+    spatial_profile = jnp.exp(-r_squared / (w0**2))
+    spatial_profile = spatial_profile[None, :, :]
+
+    return temporal_profile * spatial_profile
+
+
 @jax.jit
 def propagate_spatial_asm(E_in, z, L, wavelength, n=1.0):
     """
@@ -184,3 +219,195 @@ def propagate_asm_spatiotemporal(E_in_txy, z, L, T, wavelength_0, n_func=None):
     E_out_txy = jfft.fftshift(E_out_t_shifted, axes=0)
     
     return E_out_txy
+
+
+# Second Harmonic Generation Simulation
+
+def get_asm_phase_masks(N_t, N_x, L, T, wavelength, n_func, dz):
+    """
+    Pre-calculates the linear propagation phase mask H(kx, ky, delta_omega)
+    for a single step of distance dz.
+    """
+    c = 299792458.0
+    omega_0 = 2 * jnp.pi * c / wavelength
+    
+    # 1. Frequency Grid (Offset from carrier)
+    dt = T / N_t
+    nu_vec = jfft.fftfreq(N_t, d=dt)
+    delta_omega = 2 * jnp.pi * nu_vec
+    
+    # 2. Spatial Grid
+    dx = L / N_x
+    k_vec_spatial = 2 * jnp.pi * jfft.fftfreq(N_x, d=dx)
+    Kx, Ky = jnp.meshgrid(k_vec_spatial, k_vec_spatial, indexing='ij')
+
+    # 3. Calculate H for every frequency slice
+    # This uses the same logic as your propagate_asm_spatiotemporal
+    
+    def _get_slice_kernel(d_w):
+        omega = omega_0 + d_w
+        n = n_func(d_w)
+        k = n * omega / c
+        k_0 = n_func(0.0) * omega_0 / c
+        
+        k_z_sq = k**2 - Kx**2 - Ky**2
+        k_z = jnp.sqrt(k_z_sq.astype(jnp.complex128))
+        
+        # Envelope propagator: removes the carrier phase k_0 * z
+        return jnp.exp(1j * (k_z - k_0) * dz)
+
+    # Vectorize over frequencies
+    H_cube = jax.vmap(_get_slice_kernel)(delta_omega)
+    
+    # Shape: (N_t, N_x, N_y)
+    return H_cube
+
+# --- THE LINEAR STEP ---
+@jax.jit
+def apply_linear_step(E_txy, H_cube):
+    """
+    Applies the pre-calculated ASM phase mask.
+    E_txy: (N_t, N_x, N_y)
+    H_cube: (N_t, N_x, N_y) Pre-computed exp(i*kz*dz)
+    """
+    # FFT Time -> Freq
+    E_w = jfft.fft(E_txy, axis=0)
+    
+    # Shift Spatial -> k-space (using fft2)
+    # Note: We need ifftshift on input for standard FFT center handling
+    # but since we act on the whole cube, we can be careful.
+    # Let's stick to the robust shift-fft-shift method from your code.
+    
+    # 1. Shift time center to origin
+    E_w_shifted = jfft.ifftshift(E_w, axes=0) 
+    
+    # 2. Shift space center to origin
+    E_w_space_shifted = jfft.ifftshift(E_w_shifted, axes=(1,2))
+    
+    # 3. Spatial FFT
+    A_in = jfft.fft2(E_w_space_shifted, axes=(1,2))
+    
+    # 4. Apply Mask
+    A_out = A_in * H_cube
+    
+    # 5. Inverse Transforms
+    E_out_space_shifted = jfft.ifft2(A_out, axes=(1,2))
+    E_out_shifted = jfft.fftshift(E_out_space_shifted, axes=(1,2))
+    E_txy_out = jfft.ifft(jfft.fftshift(E_out_shifted, axes=0), axis=0)
+    
+    return E_txy_out
+
+# --- THE NONLINEAR STEP (RK4) ---
+@jax.jit
+def apply_nonlinear_step_rk4(E1, E2, dz, omega1, omega2, n1, n2, d_eff):
+    """
+    Solves the coupled ODEs for SHG over distance dz using RK4.
+    Field 1: Fundamental (omega)
+    Field 2: Second Harmonic (2*omega)
+    """
+    c = 299792458.0
+    
+    # Coupling coefficients
+    # kappa1 units: m/V * rad/s / (m/s) = 1/V. Field is V/m. Result is 1/m. Correct.
+    kappa1 = (omega1 * d_eff) / (n1 * c)
+    kappa2 = (omega2 * d_eff) / (n2 * c)
+
+    def ode_system(fields):
+        A1, A2 = fields
+        # Coupled Wave Equations
+        # dA1/dz = i * kappa1 * A2 * conj(A1)
+        # dA2/dz = i * kappa2 * A1^2
+        dA1_dz = 1j * kappa1 * A2 * jnp.conj(A1)
+        dA2_dz = 1j * kappa2 * (A1**2)
+        return (dA1_dz, dA2_dz)
+
+    # RK4 Integration
+    # k1
+    k1_A1, k1_A2 = ode_system((E1, E2))
+    
+    # k2
+    E1_k2 = E1 + 0.5 * dz * k1_A1
+    E2_k2 = E2 + 0.5 * dz * k1_A2
+    k2_A1, k2_A2 = ode_system((E1_k2, E2_k2))
+    
+    # k3
+    E1_k3 = E1 + 0.5 * dz * k2_A1
+    E2_k3 = E2 + 0.5 * dz * k2_A2
+    k3_A1, k3_A2 = ode_system((E1_k3, E2_k3))
+    
+    # k4
+    E1_k4 = E1 + dz * k3_A1
+    E2_k4 = E2 + dz * k3_A2
+    k4_A1, k4_A2 = ode_system((E1_k4, E2_k4))
+    
+    # Final Update
+    E1_new = E1 + (dz / 6.0) * (k1_A1 + 2*k2_A1 + 2*k3_A1 + k4_A1)
+    E2_new = E2 + (dz / 6.0) * (k1_A2 + 2*k2_A2 + 2*k3_A2 + k4_A2)
+    
+    return E1_new, E2_new
+
+# --- MAIN SSFM LOOP ---
+def run_shg_simulation(
+    E1_in, E2_in, 
+    L, T, 
+    lambda1, 
+    n1_func, n2_func, 
+    d_eff, 
+    z_total, N_steps
+):
+    """
+    Main driver for SHG Split-Step Fourier Method.
+    
+    Args:
+        E1_in: Fundamental field (N_t, N_x, N_y)
+        E2_in: Second harmonic field (N_t, N_x, N_y) - usually zeros
+        lambda1: Fundamental wavelength
+        n1_func, n2_func: Refractive index functions n(delta_omega) for w and 2w
+        d_eff: Effective nonlinear coefficient (m/V)
+        z_total: Total propagation distance
+        N_steps: Number of z-steps
+    """
+    dz = z_total / N_steps
+    c = 299792458.0
+    omega1 = 2 * jnp.pi * c / lambda1
+    omega2 = 2 * omega1
+    lambda2 = lambda1 / 2.0
+    
+    N_t, N_x, _ = E1_in.shape
+    
+    # 1. Pre-calculate Linear Propagators (Phase Masks)
+    # We need H for dz (full step) and dz/2 (half step)
+    H1_half = get_asm_phase_masks(N_t, N_x, L, T, lambda1, n1_func, dz/2)
+    H2_half = get_asm_phase_masks(N_t, N_x, L, T, lambda2, n2_func, dz/2)
+    
+    # For efficiency, just reuse half-steps twice? 
+    # Actually, Strang splitting is: (Lin/2) -> (Nonlin) -> (Lin/2)
+    # So we only need the half-step operators.
+    
+    # We need refractive indices at center freq for the coupling constants
+    n1_center = n1_func(0.0)
+    n2_center = n2_func(0.0)
+
+    # 2. Loop Function (JAX Scan for speed)
+    def step_fn(carry, _):
+        E1, E2 = carry
+        
+        # --- A. Linear Half-Step ---
+        E1 = apply_linear_step(E1, H1_half)
+        E2 = apply_linear_step(E2, H2_half)
+        
+        # --- B. Nonlinear Full-Step (RK4) ---
+        # Note: We apply coupling in real space (t, x, y)
+        E1, E2 = apply_nonlinear_step_rk4(
+            E1, E2, dz, omega1, omega2, n1_center, n2_center, d_eff
+        )
+        
+        # --- C. Linear Half-Step ---
+        E1 = apply_linear_step(E1, H1_half)
+        E2 = apply_linear_step(E2, H2_half)
+        
+        return (E1, E2), None
+    
+    (E1_out, E2_out), _ = jax.lax.scan(step_fn, (E1_in, E2_in), None, length=N_steps)
+    
+    return E1_out, E2_out
