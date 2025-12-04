@@ -379,7 +379,7 @@ def apply_nonlinear_step_rk4(E1, E2, dz, omega1, omega2, n1, n2, d_eff):
     return E1_new, E2_new
 
 # --- MAIN SSFM LOOP ---
-def run_shg_simulation(
+def run_shg_simulation_with_history(
     E1_in, E2_in, 
     L, T, 
     lambda1, 
@@ -388,17 +388,13 @@ def run_shg_simulation(
     z_total, N_steps
 ):
     """
-    Main driver for SHG Split-Step Fourier Method.
+    Runs SHG simulation and returns field evolution history.
     
-    Args:
-        E1_in: Fundamental field (N_t, N_x, N_y)
-        E2_in: Second harmonic field (N_t, N_x, N_y) - usually zeros
-        lambda1: Fundamental wavelength
-        n1_func, n2_func: Refractive index functions n(delta_omega) for w and 2w
-        d_eff: Effective nonlinear coefficient (m/V)
-        z_total: Total propagation distance
-        N_steps: Number of z-steps
+    Returns:
+        E1_final, E2_final: The 3D fields at the end of the crystal.
+        U1_hist, U2_hist:   1D arrays containing the Total Energy vs z.
     """
+    # 1. Setup Constants
     dz = z_total / N_steps
     c = 299792458.0
     omega1 = 2 * jnp.pi * c / lambda1
@@ -407,20 +403,16 @@ def run_shg_simulation(
     
     N_t, N_x, _ = E1_in.shape
     
-    # 1. Pre-calculate Linear Propagators (Phase Masks)
-    # We need H for dz (full step) and dz/2 (half step)
+    # 2. Pre-calculate Linear Propagators (Phase Masks)
+    # We use Strang Splitting: Linear(dz/2) -> Nonlin(dz) -> Linear(dz/2)
     H1_half = get_asm_phase_masks(N_t, N_x, L, T, lambda1, n1_func, dz/2)
     H2_half = get_asm_phase_masks(N_t, N_x, L, T, lambda2, n2_func, dz/2)
     
-    # For efficiency, just reuse half-steps twice? 
-    # Actually, Strang splitting is: (Lin/2) -> (Nonlin) -> (Lin/2)
-    # So we only need the half-step operators.
-    
-    # We need refractive indices at center freq for the coupling constants
+    # Get refractive indices at center frequency for the nonlinear coupling
     n1_center = n1_func(0.0)
     n2_center = n2_func(0.0)
 
-    # 2. Loop Function (JAX Scan for speed)
+    # 3. Define the Stepping Function
     def step_fn(carry, _):
         E1, E2 = carry
         
@@ -429,7 +421,6 @@ def run_shg_simulation(
         E2 = apply_linear_step(E2, H2_half)
         
         # --- B. Nonlinear Full-Step (RK4) ---
-        # Note: We apply coupling in real space (t, x, y)
         E1, E2 = apply_nonlinear_step_rk4(
             E1, E2, dz, omega1, omega2, n1_center, n2_center, d_eff
         )
@@ -438,8 +429,21 @@ def run_shg_simulation(
         E1 = apply_linear_step(E1, H1_half)
         E2 = apply_linear_step(E2, H2_half)
         
-        return (E1, E2), None
+        # --- D. Calculate Energy (History Tracking) ---
+        # We sum |E|^2. This is proportional to Energy. 
+        # (To get Joules, one would multiply by dx*dy*dt*constants later)
+        U1 = jnp.sum(jnp.abs(E1)**2)
+        U2 = jnp.sum(jnp.abs(E2)**2)
+        
+        # Return new state AND data to stack
+        return (E1, E2), (U1, U2)
+
+    # 4. Run the Loop (Scan)
+    (E1_out, E2_out), (U1_hist, U2_hist) = jax.lax.scan(
+        step_fn,          # Function to apply
+        (E1_in, E2_in),   # Initial state
+        None,             # Inputs to loop (None because our operators are constant)
+        length=N_steps    # Number of iterations
+    )
     
-    (E1_out, E2_out), _ = jax.lax.scan(step_fn, (E1_in, E2_in), None, length=N_steps)
-    
-    return E1_out, E2_out
+    return E1_out, E2_out, U1_hist, U2_hist
