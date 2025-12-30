@@ -344,9 +344,9 @@ def apply_nonlinear_step_rk4(E1, E2, dz, omega1, omega2, n1, n2, d_eff):
     def ode_system(fields):
         A1, A2 = fields
         # Coupled Wave Equations
-        # dA1/dz = i * kappa1 * A2 * conj(A1)
+        # dA1/dz = 2i * kappa1 * A2 * conj(A1)
         # dA2/dz = i * kappa2 * A1^2
-        dA1_dz = 1j * kappa1 * A2 * jnp.conj(A1)
+        dA1_dz = 2j * kappa1 * A2 * jnp.conj(A1)
         dA2_dz = 1j * kappa2 * (A1**2)
         return (dA1_dz, dA2_dz)
 
@@ -429,8 +429,8 @@ def run_shg_simulation_with_history(
         # --- D. Calculate Energy (History Tracking) ---
         # We sum |E|^2. This is proportional to Energy. 
         # (To get Joules, one would multiply by dx*dy*dt*constants later)
-        U1 = jnp.sum(jnp.abs(E1)**2)
-        U2 = jnp.sum(jnp.abs(E2)**2)
+        U1 = jnp.sum(jnp.abs(E1)**2)*n1_center
+        U2 = jnp.sum(jnp.abs(E2)**2)*n2_center
         
         # Return new state AND data to stack
         return (E1, E2), (U1, U2)
