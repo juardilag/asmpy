@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 import jax.numpy.fft as jfft
 from functools import partial
+from jax.scipy.ndimage import map_coordinates
 
 # Pulse Initialation
 
@@ -444,3 +445,99 @@ def run_shg_simulation_with_history(
     )
     
     return E1_out, E2_out, U1_hist, U2_hist
+
+
+# SPDC Implementation
+
+@jax.jit
+def calculate_spdc_biphoton_state(
+    Ep_xy,       # Spatial pump field (N, N)
+    L,           # Crystal Length
+    L_transverse,# Transverse physical size of grid (width)
+    wavelength_p, 
+    wavelength_s, 
+    wavelength_i,
+    n_p, n_s, n_i # Refractive indices (scalars or functions of q)
+):
+    """
+    Calculates the SPDC Biphoton Wave Function psi(qs, qi) in momentum space.
+    
+    Args:
+        Ep_xy: Input spatial pump field at z=0.
+        L: Crystal length (longitudinal).
+        L_transverse: Physical grid size (transverse).
+        wavelengths: Pump, Signal, Idler (meters).
+        n_x: Refractive indices.
+        
+    Returns:
+        psi_4d: The 4D probability amplitude (N, N, N, N).
+                Dimensions: (qs_x, qs_y, qi_x, qi_y)
+        q_vec: The momentum coordinate vector.
+    """
+    N = Ep_xy.shape[0]
+    
+    # 1. Define Momentum Grids (q)
+    q_vec = 2 * jnp.pi * jfft.fftfreq(N, d=L_transverse/N)
+    q_vec = jfft.fftshift(q_vec) 
+    
+    qx = q_vec
+    qy = q_vec
+    
+    # 2. Get Pump Angular Spectrum (E_tilde)
+    Ep_k_shifted = jfft.fftshift(jfft.fft2(jfft.ifftshift(Ep_xy)))
+    
+    # 3. Calculate Longitudinal Mismatch (Delta k_z)
+    c = 299792458.0
+    kp_0 = 2 * jnp.pi * n_p / wavelength_p
+    ks_0 = 2 * jnp.pi * n_s / wavelength_s
+    ki_0 = 2 * jnp.pi * n_i / wavelength_i
+    
+    # Reshape for broadcasting 4D
+    Qsx = qx[:, None, None, None]
+    Qsy = qy[None, :, None, None]
+    Qix = qx[None, None, :, None]
+    Qiy = qy[None, None, None, :]
+    
+    # Paraxial approximation for kz
+    ks_z = ks_0 - (Qsx**2 + Qsy**2) / (2 * ks_0)
+    ki_z = ki_0 - (Qix**2 + Qiy**2) / (2 * ki_0)
+    
+    # Pump depends on SUM of momenta
+    Qpx = Qsx + Qix
+    Qpy = Qsy + Qiy
+    kp_z = kp_0 - (Qpx**2 + Qpy**2) / (2 * kp_0)
+    
+    delta_kz = kp_z - ks_z - ki_z
+    
+    # Phase Matching Function
+    arg = delta_kz * L / 2
+    phi_phase_match = jnp.sinc(arg / jnp.pi) * jnp.exp(1j * arg)
+    
+    # 4. Interpolate Pump Spectrum at (Qpx, Qpy)
+    dq = q_vec[1] - q_vec[0]
+    center = N / 2.0
+    
+    # Convert physical momentum to array index (Sparse shapes)
+    coords_x = (Qpx / dq) + center # Shape: (N, 1, N, 1)
+    coords_y = (Qpy / dq) + center # Shape: (1, N, 1, N)
+
+    # We must expand coords to the full (N, N, N, N) grid before flattening.
+    # We can do this by broadcasting them against each other.
+    coords_x_full, coords_y_full = jnp.broadcast_arrays(coords_x, coords_y)
+    
+    # Now ravel produces N^4 elements (16,777,216) instead of N^2
+    coords_flat = jnp.stack([coords_x_full.ravel(), coords_y_full.ravel()])
+    
+    # Interpolate Real and Imag parts separately
+    Ep_real = map_coordinates(jnp.real(Ep_k_shifted), coords_flat, order=1, mode='constant', cval=0.0)
+    Ep_imag = map_coordinates(jnp.imag(Ep_k_shifted), coords_flat, order=1, mode='constant', cval=0.0)
+    
+    Ep_sum_flat = Ep_real + 1j * Ep_imag
+    
+    # Now reshape works because size is correct
+    Ep_sum_4d = Ep_sum_flat.reshape(N, N, N, N)
+    
+    # 5. Final State
+    psi = Ep_sum_4d * phi_phase_match
+    
+    return psi, q_vec
